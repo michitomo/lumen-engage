@@ -3,9 +3,10 @@ import json
 import base64
 import asyncio
 import time # Add for timestamp-based cleanup
-from fastapi import FastAPI, WebSocket, BackgroundTasks, HTTPException
+from fastapi import FastAPI, WebSocket, BackgroundTasks, HTTPException, Header
 from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware  # Add CORS middleware
 from pydantic import BaseModel
 from twilio.rest import Client
 import websockets
@@ -31,10 +32,32 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 PHONE_NUMBER_FROM = os.getenv('PHONE_NUMBER_FROM')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 raw_domain = os.getenv('DOMAIN', '')
+
+# For EC2 deployment: Handle domain configuration
+if not raw_domain:
+    # If DOMAIN is not set, try to get EC2 public IP or hostname
+    ec2_public_ip = os.getenv('EC2_PUBLIC_IP', '')
+    if ec2_public_ip:
+        raw_domain = ec2_public_ip
+        print(f"Using EC2_PUBLIC_IP: {ec2_public_ip}")
+    else:
+        # Fallback - you should set this manually for production
+        print("WARNING: No DOMAIN or EC2_PUBLIC_IP set. WebSocket connections may fail.")
+        raw_domain = 'localhost'
+else:
+    print(f"Using DOMAIN from env: {raw_domain}")
+
 # Strip protocols and trailing slashes from DOMAIN for WebSocket URL
 DOMAIN = re.sub(r'(^\w+:|^)\/\/|\/+$', '', raw_domain) 
+print(f"Final DOMAIN after processing: '{DOMAIN}'")
 
 PORT = int(os.getenv('PORT', 6060))
+
+# EC2 Security: Add allowed origins for CORS if needed
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
+
+# EC2 Health check configuration
+HEALTH_CHECK_TOKEN = os.getenv('HEALTH_CHECK_TOKEN', None)  # Optional security token for health checks
 
 # Updated SYSTEM_MESSAGE based on the product concept and AI persona "ルーメン"
 # This is the core instruction for the AI's behavior
@@ -101,6 +124,15 @@ LOG_EVENT_TYPES = [
 ]
 
 app = FastAPI()
+
+# Add CORS middleware for EC2 deployment
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and PHONE_NUMBER_FROM and OPENAI_API_KEY):
     raise ValueError('Missing Twilio and/or OpenAI environment variables. Please set them in the .env file.')
@@ -222,104 +254,112 @@ async def handle_media_stream(websocket: WebSocket):
     company_name = call_data['company_name'] if call_data else '貴社'
     current_date_jst = call_data['current_date_jst'] if call_data else '本日'
 
-    async with websockets.connect(
-        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', # Use the recommended model for Realtime
-        additional_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
-        # Use the fixed VOICE here
-        await initialize_session(openai_ws, voice=VOICE, customer_name=customer_name, company_name=company_name, current_date_jst=current_date_jst) 
-        stream_sid = None
+    print(f"Attempting to connect to OpenAI WebSocket...")
+    try:
+        async with websockets.connect(
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', # Use the recommended model for Realtime
+            additional_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        ) as openai_ws:
+            print("Connected to OpenAI WebSocket successfully")
+            # Use the fixed VOICE here
+            await initialize_session(openai_ws, voice=VOICE, customer_name=customer_name, company_name=company_name, current_date_jst=current_date_jst) 
+            stream_sid = None
 
-        # Send initial conversation item with customer info and date - moved to initialize_session
-        # await send_initial_conversation_item(openai_ws, customer_name=customer_name, company_name=company_name, current_date_jst=current_date_jst)
+            # Send initial conversation item with customer info and date - moved to initialize_session
+            # await send_initial_conversation_item(openai_ws, customer_name=customer_name, company_name=company_name, current_date_jst=current_date_jst)
 
-        async def receive_from_twilio():
-            """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    if data['event'] == 'media' and openai_ws.state == websockets.protocol.State.OPEN:
-                        audio_append = {
-                            "type": "input_audio_buffer.append",
-                            "audio": data['media']['payload']
-                        }
-                        await openai_ws.send(json.dumps(audio_append))
-                    elif data['event'] == 'start':
-                        stream_sid = data['start']['streamSid']
-                        print(f"Incoming stream has started {stream_sid}")
-                    elif data['event'] == 'stop': # Handle call end
-                         print(f"Twilio stream {stream_sid} stopped.")
-                         if openai_ws.state == websockets.protocol.State.OPEN:
-                             await openai_ws.close() # Close OpenAI WebSocket
-                             print("Closed OpenAI WebSocket.")
-
-            except WebSocketDisconnect:
-                print("Client disconnected (WebSocketDisconnect).")
-                if openai_ws.open:
-                    await openai_ws.close() # Close OpenAI WebSocket
-                    print("Closed OpenAI WebSocket on client disconnect.")
-            except Exception as e:
-                print(f"Error in receive_from_twilio: {e}")
-                if openai_ws.open:
-                    try:
-                         await openai_ws.close() # Attempt to close OpenAI WebSocket
-                         print("Closed OpenAI WebSocket due to error.")
-                    except Exception as close_e:
-                         print(f"Error closing OpenAI WebSocket: {close_e}")
-
-
-        async def send_to_twilio():
-            """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid
-            try:
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
-                    if response['type'] in LOG_EVENT_TYPES:
-                        # Log important events, avoid excessive logging of audio delta
-                        if response['type'] != 'response.audio.delta':
-                             print(f"Received event: {response['type']}", response)
-                    
-                    if response['type'] == 'session.updated':
-                        print("Session updated successfully:", response)
-                        
-                    if response['type'] == 'response.audio.delta' and response.get('delta'):
-                        try:
-                            # Process audio payload the same way as the working web.py
-                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
-                            
-                            # Ensure stream_sid is available before sending media
-                            if stream_sid:
-                                audio_delta = {
-                                    "event": "media",
-                                    "streamSid": stream_sid,
-                                    "media": {
-                                        "payload": audio_payload
-                                    }
-                                }
-                                await websocket.send_json(audio_delta)
-                            # else: # Optional: log if stream_sid is not available
-                            #    print("Warning: stream_sid not available, cannot send audio_delta.")
-
-                        except Exception as e:
-                            print(f"Error processing audio data: {e}")
-            except websockets.exceptions.ConnectionClosedOK:
-                 print("OpenAI WebSocket closed gracefully.")
-            except Exception as e:
-                print(f"Error in send_to_twilio: {e}")
-                # If this loop exits due to error, try to close the Twilio WebSocket
+            async def receive_from_twilio():
+                """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
+                nonlocal stream_sid
                 try:
-                    await websocket.close()
-                    print("Closed Twilio WebSocket due to error in send_to_twilio.")
-                except Exception as close_e:
-                     print(f"Error closing Twilio WebSocket: {close_e}")
+                    async for message in websocket.iter_text():
+                        data = json.loads(message)
+                        if data['event'] == 'media' and openai_ws.state == websockets.protocol.State.OPEN:
+                            audio_append = {
+                                "type": "input_audio_buffer.append",
+                                "audio": data['media']['payload']
+                            }
+                            await openai_ws.send(json.dumps(audio_append))
+                        elif data['event'] == 'start':
+                            stream_sid = data['start']['streamSid']
+                            print(f"Incoming stream has started {stream_sid}")
+                        elif data['event'] == 'stop': # Handle call end
+                             print(f"Twilio stream {stream_sid} stopped.")
+                             if openai_ws.state == websockets.protocol.State.OPEN:
+                                 await openai_ws.close() # Close OpenAI WebSocket
+                                 print("Closed OpenAI WebSocket.")
+
+                except WebSocketDisconnect:
+                    print("Client disconnected (WebSocketDisconnect).")
+                    if openai_ws.open:
+                        await openai_ws.close() # Close OpenAI WebSocket
+                        print("Closed OpenAI WebSocket on client disconnect.")
+                except Exception as e:
+                    print(f"Error in receive_from_twilio: {e}")
+                    if openai_ws.open:
+                        try:
+                             await openai_ws.close() # Attempt to close OpenAI WebSocket
+                             print("Closed OpenAI WebSocket due to error.")
+                        except Exception as close_e:
+                             print(f"Error closing OpenAI WebSocket: {close_e}")
 
 
-        # Ensure both tasks run concurrently
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            async def send_to_twilio():
+                """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
+                nonlocal stream_sid
+                try:
+                    async for openai_message in openai_ws:
+                        response = json.loads(openai_message)
+                        if response['type'] in LOG_EVENT_TYPES:
+                            # Log important events, avoid excessive logging of audio delta
+                            if response['type'] != 'response.audio.delta':
+                                 print(f"Received event: {response['type']}", response)
+                        
+                        if response['type'] == 'session.updated':
+                            print("Session updated successfully:", response)
+                            
+                        if response['type'] == 'response.audio.delta' and response.get('delta'):
+                            try:
+                                # Process audio payload the same way as the working web.py
+                                audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                                
+                                # Ensure stream_sid is available before sending media
+                                if stream_sid:
+                                    audio_delta = {
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {
+                                            "payload": audio_payload
+                                        }
+                                    }
+                                    await websocket.send_json(audio_delta)
+                                # else: # Optional: log if stream_sid is not available
+                                #    print("Warning: stream_sid not available, cannot send audio_delta.")
+
+                            except Exception as e:
+                                print(f"Error processing audio data: {e}")
+                except websockets.exceptions.ConnectionClosedOK:
+                     print("OpenAI WebSocket closed gracefully.")
+                except Exception as e:
+                    print(f"Error in send_to_twilio: {e}")
+                    # If this loop exits due to error, try to close the Twilio WebSocket
+                    try:
+                        await websocket.close()
+                        print("Closed Twilio WebSocket due to error in send_to_twilio.")
+                    except Exception as close_e:
+                         print(f"Error closing Twilio WebSocket: {close_e}")
+
+
+            # Ensure both tasks run concurrently
+            await asyncio.gather(receive_from_twilio(), send_to_twilio())
+
+    except Exception as e:
+        print(f"Failed to connect to OpenAI WebSocket: {e}")
+        await websocket.close()
+        return
 
 
 async def send_initial_conversation_item(openai_ws, customer_name: str, company_name: str, current_date_jst: str):
@@ -417,9 +457,55 @@ async def initiate_call(phone_number_to_call: str, voice: str, name: str, compan
     # All of the rules of TCPA apply even if a call is made by AI.
     # Do your own diligence for compliance.
 
-    # Construct WebSocket URL with query parameters
-    # Pass name, company_name, and current_date_jst via query parameters
-    ws_url = f"wss://{DOMAIN}/media-stream"
+    # Determine protocol based on whether we're using HTTPS or not
+    # For SSL deployments (domain with SSL or ngrok), use https://
+    # For EC2 without SSL, use http:// (but this won't work with Twilio in production)
+    use_ssl = os.getenv('USE_SSL', 'false').lower() == 'true'
+    
+    # Check if DOMAIN includes protocol already (for ngrok compatibility)
+    if raw_domain.startswith(('http://', 'https://')):
+        # Extract protocol from domain
+        use_ssl = raw_domain.startswith('https://')
+        print(f"Domain includes protocol, extracted SSL setting: {use_ssl}")
+    
+    # For WebSocket connections: ws:// or wss://
+    ws_protocol = "wss" if use_ssl else "ws"
+    print(f"WebSocket protocol for TwiML: {ws_protocol}")
+    print(f"SSL enabled: {use_ssl}")
+    print(f"Port: {PORT}")
+    
+    # Determine if we should include port in URL
+    # Standard ports (80 for ws, 443 for wss) are usually omitted
+    # Custom ports are included unless using a reverse proxy
+    include_port = True
+    
+    if PORT == 80 and ws_protocol == "ws":
+        include_port = False
+        print("Using standard WebSocket port 80, omitting from URL")
+    elif PORT == 443 and ws_protocol == "wss":
+        include_port = False
+        print("Using standard WebSocket Secure port 443, omitting from URL")
+    elif use_ssl and PORT == 6060:
+        # Check if we're behind a reverse proxy (like Nginx)
+        # In production with Nginx, the external port would be 443, not 6060
+        behind_proxy = os.getenv('BEHIND_PROXY', 'false').lower() == 'true'
+        if behind_proxy:
+            include_port = False
+            print("Behind reverse proxy, omitting port from URL")
+        else:
+            print(f"Direct SSL setup, including port {PORT} in URL")
+    else:
+        print(f"Using custom port {PORT}, including in URL")
+    
+    # Construct WebSocket Stream URL with query parameters
+    # Use WebSocket protocol - wss:// for SSL, ws:// for non-SSL
+    if include_port:
+        stream_url = f"{ws_protocol}://{DOMAIN}:{PORT}/media-stream"
+    else:
+        stream_url = f"{ws_protocol}://{DOMAIN}/media-stream"
+    
+    print(f"Base WebSocket Stream URL: {stream_url}")
+    
     # Generate a unique call ID for this call (using call SID later)
     temp_call_id = str(uuid.uuid4())
     query_params = {
@@ -429,11 +515,23 @@ async def initiate_call(phone_number_to_call: str, voice: str, name: str, compan
 
     # Encode query parameters with proper handling of special characters
     encoded_query_params = '&'.join(f"{key}={urllib.parse.quote(value)}" for key, value in query_params.items())
-    ws_url_with_params = f"{ws_url}?{encoded_query_params}"
+    stream_url_with_params = f"{stream_url}?{encoded_query_params}"
+    print(f"Stream URL with params: {stream_url_with_params}")
     
     # Properly escape the URL for XML
-    escaped_ws_url = html.escape(ws_url_with_params)
-    print(f"WebSocket URL sent to Twilio: {escaped_ws_url}") # Log the exact URL
+    escaped_stream_url = html.escape(stream_url_with_params)
+    print(f"Escaped Stream URL: {escaped_stream_url}")
+    
+    # Check URL length and format
+    print(f"URL length: {len(escaped_stream_url)} characters")
+    if len(escaped_stream_url) > 2048:
+        print("WARNING: URL is very long, might cause issues")
+    
+    # Validate URL format - should be WebSocket (ws:// or wss://) for TwiML Media Streams
+    if not escaped_stream_url.startswith(('ws://', 'wss://')):
+        print(f"ERROR: Invalid URL protocol in: {escaped_stream_url}")
+    
+    print(f"WebSocket Stream URL sent to Twilio: {escaped_stream_url}") # Log the exact URL
 
     # Store call data in global storage with timestamp for cleanup
     CALL_DATA_STORAGE[temp_call_id] = {
@@ -446,7 +544,7 @@ async def initiate_call(phone_number_to_call: str, voice: str, name: str, compan
 
     outbound_twiml = (
         f'<?xml version="1.0" encoding="UTF-8"?>'
-        f'<Response><Connect><Stream url="{escaped_ws_url}" /></Connect></Response>'
+        f'<Response><Connect><Stream url="{escaped_stream_url}" /></Connect></Response>'
     )
     print(f"TwiML: {outbound_twiml}")
 
@@ -480,10 +578,28 @@ async def log_call_sid(call_sid):
     # In a real application, you would log this to a database, monitoring system, etc.
 
 @app.get('/health')
-async def health_check():
-    """Health check endpoint."""
-    # Basic check, could be expanded to check external dependencies like Twilio/OpenAI status
-    return {"status": "healthy", "service": "Lumen Engage AI Voice Assistant"}
+async def health_check(authorization: str = Header(None)):
+    """Health check endpoint for EC2 load balancer."""
+    # Optional security check for health endpoint
+    if HEALTH_CHECK_TOKEN and authorization != f"Bearer {HEALTH_CHECK_TOKEN}":
+        # Still return 200 for basic health checks, but with limited info
+        return {"status": "ok"}
+    
+    # Detailed health check
+    health_status = {
+        "status": "healthy",
+        "service": "Lumen Engage AI Voice Assistant",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0",
+        "environment": {
+            "domain": DOMAIN,
+            "port": PORT,
+            "has_twilio_config": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN),
+            "has_openai_config": bool(OPENAI_API_KEY)
+        }
+    }
+    
+    return health_status
 
 if __name__ == "__main__":
     print(
