@@ -96,16 +96,14 @@ SYSTEM_MESSAGE = (
     "**会話の基本フロー:**\n"
     "1.  **オープニング:** 「Lumen EngageのAIアシスタント、ルーメン」であること、LP登録に関する連絡であること、お客様のお名前と会社名を確認することを簡潔に伝える。「[会社名]の[苗字]様でいらっしゃいますでしょうか？」と問いかける。\n"
     "2.  **時間確認:** 名前・会社名が確認できたら、**簡潔に**「今、少しお時間よろしいでしょうか？」と時間があるか確認する。\n"
-    "3.  **ヒアリング（最重要フェーズ）:** 時間確認が取れたら、「先ほどは弊社ウェブサイトよりお問い合わせ（または資料ダウンロード等）いただきありがとうございます。差し支えなければ、**現在、貴社ではウェブサイトからのお問い合わせやフォームに、どのようにご対応されているか**、簡単にお伺いしてもよろしいでしょうか？」と最初の質問を投げかけ、フォーム対応状況に関す
-るヒアリングを開始する。LP登録のトリガー（お問い合わせ or 資料ダウンロードなど）は会話に含めても良い。\n"
+    "3.  **ヒアリング（最重要フェーズ）:** 時間確認が取れたら、「先ほどは弊社ウェブサイトよりお問い合わせ（または資料ダウンロード等）いただきありがとうございます。差し支えなければ、**現在、貴社ではウェブサイトからのお問い合わせやフォームに、どのようにご対応されているか**、簡単にお伺いしてもよろしいでしょうか？」と最初の質問を投げかけ、フォーム対応状況に関するヒアリングを開始する。LP登録のトリガー（お問い合わせ or 資料ダウンロードなど）は会話に含めても良い。\n"
     "4.  **詳細ヒアリング（営業担当として深掘り）:** お客様の発言に対し、**一度に一つの質問のみ**で、さらに深掘りして以下の点を引き出すよう、積極的に質問を組み立てる。\n"
     "    *   ウェブサイトからのお問い合わせ対応は、**主にどなたが担当されているか**？ (例: 営業担当、マーケティング担当、事務担当など)\n"
     "    *   お問い合わせ内容の管理や、お客様への返信には、**どのようなツールやシステムを使っているか**？ (例: メールソフト、スプレッドシート、CMS付属機能、SFA/CRMなど)\n"
     "    *   現在、問い合わせ対応やフォーム運用に関して、**何か課題や手間になっていること**はあるか？\n"
     "    *   （可能であれば）お問い合わせからお客様への最初の返信まで、**平均してどのくらいの時間がかかっているか**？\n"
     "    *   （可能であれば）現在のお問い合わせ対応の体制で、**人員的な余裕はどのくらいあるか**？\n"
-    "5.  **最適な次ステップの提案（積極的な意思決定）:** ヒアリングで得られた情報（特に課題や担当者の状況、システム利用状況）を総合的に判断し、お客様にとって最も価値のある次のアクションを「ルーメン」自身が積極的に提案する。提案する際は、Lumen Engageがお客様の課題（例: 対応時間短縮、担当者の負荷軽減、情報の一元管理など）をどのように解決できるか簡潔に言及する
-。\n"
+    "5.  **最適な次ステップの提案（積極的な意思決定）:** ヒアリングで得られた情報（特に課題や担当者の状況、システム利用状況）を総合的に判断し、お客様にとって最も価値のある次のアクションを「ルーメン」自身が積極的に提案する。提案する際は、Lumen Engageがお客様の課題（例: 対応時間短縮、担当者の負荷軽減、情報の一元管理など）をどのように解決できるか簡潔に言及する。\n"
     "    *   例えば、担当者の負荷が高い、システムがアナログ（メール、スプレッドシートなど）であれば、「ルーメン」による自動化が有効であることを示唆し、詳細を説明する面談を提案する。\n"
     "    *   CMS連携の課題などがあれば、Lumen Engageの連携機能をデモできる面談を提案する。\n"
     "    *   まだ漠然とした情報収集であれば、「まずはLumen Engageの具体的な機能や導入事例をまとめた資料をメールで送らせていただきます」と代替案を提示する。\n"
@@ -197,15 +195,30 @@ async def make_call_webhook(call_request: CallRequest, background_tasks: Backgro
         if not re.match(r'^\+?[1-9]\d{7,14}$', phone_number_to_call): # E.164 basic pattern
             raise HTTPException(status_code=400, detail="Invalid phone number format. Please use E.164 format.")
 
-        # Check if number is allowed
-        #is_allowed = await check_number_allowed(phone_number_to_call)
-        # For development, override this check
-        is_allowed = True # Assuming check is successful for prototype
-        
+        # Check if number is allowed (US or Japan only)
+        is_allowed, country_info = await check_number_allowed(phone_number_to_call)
+
         if not is_allowed:
+            # Send Discord notification for rejected call attempt
+            rejected_call_data = {
+                'name': call_request.name,
+                'company_name': call_request.company_name,
+                'phone_number': phone_number_to_call,
+                'call_sid': 'REJECTED',
+                'duration': 'N/A',
+                'rejection_reason': f"Phone number not allowed - {country_info}"
+            }
+
+            # Send notification in background
+            background_tasks.add_task(
+                send_discord_notification,
+                rejected_call_data,
+                f"❌ **通話拒否**\n理由: 米国と日本の電話番号のみ許可されています\n検出された国コード: {country_info}"
+            )
+
             raise HTTPException(
-                status_code=403, 
-                detail=f"The number {phone_number_to_call} is not recognized as a valid outgoing number or caller ID."
+                status_code=403,
+                detail=f"Phone number {phone_number_to_call} is not allowed. Only US (+1) and Japan (+81) numbers are permitted."
             )
 
         # Get current date in JST for AI prompt
@@ -265,18 +278,20 @@ async def handle_media_stream(websocket: WebSocket):
     # Use retrieved data or defaults
     customer_name = call_data['name'] if call_data else 'お客様'
     company_name = call_data['company_name'] if call_data else '貴社'
+    phone_number = call_data['phone_number'] if call_data else 'N/A'
     current_date_jst = call_data['current_date_jst'] if call_data else '本日'
 
     # Initialize conversation tracking
     conversation_start_time = time.time()
     # Generate a fallback ID if call_id is None
     tracking_id = call_id or f"session_{int(conversation_start_time)}"
-    
+
     conversation_data = {
         'call_id': call_id,
         'tracking_id': tracking_id,
         'customer_name': customer_name,
         'company_name': company_name,
+        'phone_number': phone_number,
         'start_time': conversation_start_time,
         'customer_confirmed': False,
         'current_inquiry_process': None,
@@ -372,6 +387,7 @@ async def handle_media_stream(websocket: WebSocket):
                                  discord_call_data = {
                                      'name': customer_name,
                                      'company_name': company_name,
+                                     'phone_number': phone_number,
                                      'call_sid': stream_sid or call_id or tracking_id,
                                      'duration': duration_str
                                  }
@@ -392,6 +408,7 @@ async def handle_media_stream(websocket: WebSocket):
                                  basic_call_data = {
                                      'name': customer_name,
                                      'company_name': company_name,
+                                     'phone_number': phone_number,
                                      'call_sid': stream_sid or call_id or tracking_id or 'unknown',
                                      'duration': 'unknown'
                                  }
@@ -431,6 +448,7 @@ async def handle_media_stream(websocket: WebSocket):
                         discord_call_data = {
                             'name': customer_name,
                             'company_name': company_name,
+                            'phone_number': phone_number,
                             'call_sid': stream_sid or call_id or tracking_id,
                             'duration': duration_str
                         }
@@ -448,6 +466,7 @@ async def handle_media_stream(websocket: WebSocket):
                         basic_call_data = {
                             'name': customer_name,
                             'company_name': company_name,
+                            'phone_number': phone_number,
                             'call_sid': stream_sid or call_id or tracking_id or 'unknown',
                             'duration': 'unknown'
                         }
@@ -675,28 +694,34 @@ async def initialize_session(openai_ws, voice: str = "alloy", customer_name: str
     # Send initial conversation item with customer info and date
     await send_initial_conversation_item(openai_ws, customer_name=customer_name, company_name=company_name, current_date_jst=current_date_jst)
 
-# This function remains largely the same, but added logging and error handling
+# This function checks if a phone number is from an allowed country (US or Japan)
 async def check_number_allowed(to):
-    """Check if a number is allowed to be called."""
+    """Check if a number is allowed to be called (US or Japan only)."""
     try:
-        # Placeholder for actual number validation/checking logic
-        # You might check against a list of approved numbers, or Twilio capabilities
         print(f"Checking if number {to} is allowed...")
-        # In a real scenario, implement checks like:
-        # 1. Is this an E.164 formatted number? (Already done in make_call_webhook)
-        # 2. Do you have permission to call this number? (e.g., is it in your CRM as an opt-in contact?)
-        # 3. Is this a known invalid number (e.g., premium rate, internal, etc.)?
 
-        # For the prototype, we are always returning True as overridden in make_call_webhook
-        # The original code checked Twilio IncomingPhoneNumbers or OutgoingCallerIds,
-        # which might not be the correct check for *calling* a customer number.
-        # A customer number is usually not one of your Twilio numbers or caller IDs.
-        # Returning True here bypasses that check based on the original override.
-        return True 
+        # Validate that it's E.164 formatted (should already be done by this point)
+        if not to.startswith('+'):
+            print(f"Number {to} is not in E.164 format")
+            return False, "Invalid format"
+
+        # Check if the number is from US (+1) or Japan (+81)
+        if to.startswith('+1'):
+            print(f"Number {to} is from US - ALLOWED")
+            return True, "US"
+        elif to.startswith('+81'):
+            print(f"Number {to} is from Japan - ALLOWED")
+            return True, "Japan"
+        else:
+            # Extract country code for logging
+            country_code = to[1:4] if len(to) > 3 else to[1:]
+            print(f"Number {to} with country code +{country_code} is NOT ALLOWED (only US +1 and Japan +81 are allowed)")
+            return False, f"Country code +{country_code}"
+
     except Exception as e:
         print(f"Error checking phone number {to}: {e}")
         # Return False in case of error for safety
-        return False
+        return False, "Error"
 
 async def initiate_call(phone_number_to_call: str, voice: str, name: str, company_name: str, current_date_jst: str):
     """Make an outbound call."""
@@ -787,6 +812,7 @@ async def initiate_call(phone_number_to_call: str, voice: str, name: str, compan
     CALL_DATA_STORAGE[temp_call_id] = {
         'name': name,
         'company_name': company_name,
+        'phone_number': phone_number_to_call,
         'current_date_jst': current_date_jst,
         'timestamp': time.time()
     }
@@ -856,6 +882,7 @@ async def test_discord_notification():
     test_call_data = {
         'name': 'テスト太郎',
         'company_name': 'テスト株式会社',
+        'phone_number': '+81312345678',
         'call_sid': 'TEST_CALL_SID_123',
         'duration': '3分45秒'
     }
@@ -918,20 +945,23 @@ async def send_discord_notification(call_data: dict, conversation_summary: str =
         jst = pytz.timezone('Asia/Tokyo')
         current_time_jst = datetime.now(jst).strftime('%Y年%m月%d日 %H:%M:%S JST')
         
+        # Determine if this is a rejected call
+        is_rejected = call_data.get('call_sid') == 'REJECTED'
+
         # Prepare the Discord embed
         embed = {
-            "title": "🔔 通話完了通知",
-            "color": 0x00ff00,  # Green color
+            "title": "❌ 通話拒否通知" if is_rejected else "🔔 通話完了通知",
+            "color": 0xff0000 if is_rejected else 0x00ff00,  # Red for rejected, Green for completed
             "timestamp": datetime.now(timezone.utc).isoformat(),  # Fix deprecation warning
             "fields": [
                 {
                     "name": "👤 お客様情報",
-                    "value": f"**名前:** {call_data.get('name', 'N/A')}\n**会社名:** {call_data.get('company_name', 'N/A')}",
+                    "value": f"**名前:** {call_data.get('name', 'N/A')}\n**会社名:** {call_data.get('company_name', 'N/A')}\n**電話番号:** {call_data.get('phone_number', 'N/A')}",
                     "inline": False
                 },
                 {
                     "name": "📞 通話情報",
-                    "value": f"**通話ID:** {call_data.get('call_sid', 'N/A')}\n**完了時刻:** {current_time_jst}",
+                    "value": f"**通話ID:** {call_data.get('call_sid', 'N/A')}\n**{'拒否理由' if is_rejected else '完了時刻'}:** {call_data.get('rejection_reason', current_time_jst)}",
                     "inline": False
                 }
             ]
